@@ -10,7 +10,7 @@ Freifunk München - Jahresrückblick 2025
 
 ## Einleitung
 
-2025 war ein bedeutendes Jahr für Freifunk München. Als nichtkommerzielle Initiative für den Aufbau freier (Funk-)Netze konnten wir unsere Services weiter ausbauen und die Community stärken.
+Test
 
 ## Netzwerk-Statistiken
 
