@@ -1,0 +1,303 @@
+name: PR Screenshots
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  screenshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Cache Ruby gems
+        uses: actions/cache@v4
+        with:
+          path: vendor/bundle
+          key: ${{ runner.os }}-gems-${{ hashFiles('**/Gemfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-gems-
+
+      - name: Set up Ruby environment
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: true
+          cache-version: 0
+
+      - name: Install dependencies
+        run: bundle install --jobs $(nproc) --retry 3 --path vendor/bundle
+
+      - name: Build Jekyll site
+        run: bundle exec jekyll build --trace
+        env:
+          JEKYLL_ENV: production
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            **/*.md
+            **/*.html
+            **/*.markdown
+
+      - name: Install Playwright
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          npm init -y
+          npm install -D playwright
+          npx playwright install chromium
+          npx playwright install-deps chromium
+
+      - name: Start local server
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          cd _site
+          python3 -m http.server 8080 &
+          echo $! > server.pid
+          sleep 5
+
+      - name: Create screenshot script
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          cat > take-screenshots.js << 'EOF'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const path = require('path');
+
+          async function takeScreenshots(files) {
+            const browser = await chromium.launch();
+            const context = await browser.newContext({
+              viewport: { width: 1280, height: 1024 }
+            });
+            const page = await context.newPage();
+
+            const screenshots = [];
+            const screenshotDir = 'screenshots';
+            
+            if (!fs.existsSync(screenshotDir)) {
+              fs.mkdirSync(screenshotDir, { recursive: true });
+            }
+
+            for (const file of files) {
+              try {
+                // Convert file path to URL path
+                let urlPath = file
+                  .replace(/^_posts\//, '')
+                  .replace(/\.markdown$/, '')
+                  .replace(/\.md$/, '')
+                  .replace(/\.html$/, '');
+
+                // Handle posts with date format
+                const postMatch = urlPath.match(/^(\d{4})-(\d{2})-(\d{2})-(.+)$/);
+                if (postMatch) {
+                  const [, year, month, day, slug] = postMatch;
+                  urlPath = `${year}/${month}/${day}/${slug}`;
+                } else if (urlPath.startsWith('_pages/')) {
+                  urlPath = urlPath.replace(/^_pages\//, '');
+                } else if (!urlPath.endsWith('/')) {
+                  urlPath = urlPath.replace(/^/, '');
+                }
+
+                const url = `http://localhost:8080/${urlPath}`;
+                console.log(`Taking screenshot of: ${url}`);
+
+                await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+                
+                const screenshotPath = path.join(screenshotDir, `${file.replace(/\//g, '_')}.png`);
+                await page.screenshot({ 
+                  path: screenshotPath,
+                  fullPage: true 
+                });
+
+                screenshots.push({
+                  file: file,
+                  path: screenshotPath,
+                  url: urlPath
+                });
+              } catch (error) {
+                console.error(`Error capturing ${file}:`, error.message);
+              }
+            }
+
+            await browser.close();
+            return screenshots;
+          }
+
+          const changedFiles = process.argv[2].split(',').filter(f => f.trim());
+          takeScreenshots(changedFiles).then(screenshots => {
+            fs.writeFileSync('screenshots.json', JSON.stringify(screenshots, null, 2));
+            console.log(`Created ${screenshots.length} screenshots`);
+          });
+          EOF
+
+      - name: Take screenshots
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          node take-screenshots.js "${{ steps.changed-files.outputs.all_changed_files }}"
+
+      - name: Upload screenshots to artifact
+        if: steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-screenshots
+          path: screenshots/
+          retention-days: 30
+
+      - name: Upload screenshots and create comment
+        if: steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Read screenshots info
+            const screenshotsData = JSON.parse(fs.readFileSync('screenshots.json', 'utf8'));
+            
+            if (screenshotsData.length === 0) {
+              console.log('No screenshots to upload');
+              return;
+            }
+
+            // Upload screenshots to GitHub via Git Blob API and get URLs
+            const uploadedScreenshots = [];
+            const branchName = `screenshots-pr-${context.issue.number}`;
+            
+            try {
+              // Try to get the branch, create if it doesn't exist
+              let ref;
+              try {
+                ref = await github.rest.git.getRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `heads/${branchName}`
+                });
+              } catch (error) {
+                // Branch doesn't exist, create it from main
+                const mainRef = await github.rest.git.getRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: 'heads/main'
+                });
+                
+                ref = await github.rest.git.createRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `refs/heads/${branchName}`,
+                  sha: mainRef.data.object.sha
+                });
+              }
+
+              // Upload each screenshot
+              for (const screenshot of screenshotsData) {
+                try {
+                  const imageBuffer = fs.readFileSync(screenshot.path);
+                  const base64Image = imageBuffer.toString('base64');
+                  const filename = path.basename(screenshot.path);
+                  const filePath = `screenshots/${filename}`;
+
+                  // Create or update the file
+                  let sha;
+                  try {
+                    const existingFile = await github.rest.repos.getContent({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      path: filePath,
+                      ref: branchName
+                    });
+                    sha = existingFile.data.sha;
+                  } catch (error) {
+                    // File doesn't exist yet
+                  }
+
+                  await github.rest.repos.createOrUpdateFileContents({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    path: filePath,
+                    message: `Add screenshot for ${screenshot.file}`,
+                    content: base64Image,
+                    branch: branchName,
+                    ...(sha && { sha })
+                  });
+
+                  const imageUrl = `https://raw.githubusercontent.com/${context.repo.owner}/${context.repo.repo}/${branchName}/${filePath}`;
+                  
+                  uploadedScreenshots.push({
+                    file: screenshot.file,
+                    url: screenshot.url,
+                    imageUrl: imageUrl
+                  });
+                  
+                  console.log(`Uploaded ${screenshot.file} to ${imageUrl}`);
+                } catch (error) {
+                  console.error(`Error uploading ${screenshot.file}:`, error.message);
+                }
+              }
+            } catch (error) {
+              console.error('Error managing screenshot branch:', error.message);
+            }
+
+            // Create comment with embedded images
+            const artifactUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            
+            let commentBody = '## 📸 Screenshots der bearbeiteten Seiten\n\n';
+            commentBody += `Diese Screenshots wurden automatisch von den geänderten Seiten im PR erstellt.\n\n`;
+            commentBody += `---\n\n`;
+            
+            for (const screenshot of uploadedScreenshots) {
+              commentBody += `### 📄 \`${screenshot.file}\`\n\n`;
+              commentBody += `**Seite:** \`/${screenshot.url}\`\n\n`;
+              commentBody += `![Screenshot von ${screenshot.file}](${screenshot.imageUrl})\n\n`;
+              commentBody += `---\n\n`;
+            }
+            
+            commentBody += `\n📦 **Alle Screenshots herunterladen:** [GitHub Artifacts](${artifactUrl})\n`;
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('📸 Screenshots der bearbeiteten Seiten')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: commentBody
+              });
+              console.log('Updated existing comment');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+              console.log('Created new comment');
+            }
+
+
+      - name: Stop local server
+        if: always()
+        run: |
+          if [ -f _site/server.pid ]; then
+            kill $(cat _site/server.pid) || true
+          fi
